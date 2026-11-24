@@ -380,6 +380,9 @@ jobs:
           sed -i 's/cmake_minimum_required(VERSION [0-9.]*)/cmake_minimum_required(VERSION 3.5)/g' \
             /tmp/pico-sdk/tools/pioasm/CMakeLists.txt
 
+          # Nanopb in v0.7.8 benötigt protobuf 4.x (reflection.MakeClass)
+          printf "protobuf>=4.21.6,<5\ngrpcio-tools>=1.47.0,<1.63\n" > lib/nanopb/extra/requirements.txt
+
           cmake -B build -G Ninja \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_BUILD_TYPE=Release \
