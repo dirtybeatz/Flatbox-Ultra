@@ -375,17 +375,14 @@ jobs:
             exit 1
           fi
 
+          # Gilt auch für alle CMake-Unterprozesse (PioasmBuild, ELF2UF2Build)
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          sed -i 's/cmake_minimum_required(VERSION [0-9.]*)/cmake_minimum_required(VERSION 3.5)/g' \
+            /tmp/pico-sdk/tools/pioasm/CMakeLists.txt
+
           cmake -B build -G Ninja \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE="$(which python3)" \
             -DGP2040_BOARDCONFIG="${BOARD}"
           cmake --build build --parallel
-
-      - name: Upload UF2 Firmware Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: GP2040-CE-${{ github.event.inputs.board_config || env.DEFAULT_BOARD_CONFIG }}-10x25
-          path: |
-            build/*.uf2
-            build/**/*.uf2
-          if-no-files-found: error
