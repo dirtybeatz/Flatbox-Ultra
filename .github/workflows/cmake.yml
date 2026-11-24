@@ -237,6 +237,8 @@ jobs:
 
               extensions = {".ts", ".tsx", ".js", ".jsx"}
               patched_files = 0
+              inputs_patched = False
+              macro_files_checked: list[Path] = []
 
               for path in sorted(www_src.rglob("*")):
                   if path.suffix not in extensions or not path.is_file():
@@ -244,39 +246,67 @@ jobs:
 
                   original = path.read_text(encoding="utf-8", errors="replace")
                   is_macro_file = "macro" in path.name.lower()
-                  has_macro_refs = any(k in original for k in ("MAX_MACRO", "MACRO_LIMIT", "macroList", "macroInputs"))
+                  has_macro_refs = any(
+                      k in original
+                      for k in ("MAX_MACRO", "MACRO_LIMIT", "MACRO_INPUT", "MAX_INPUT", "macroList", "macroInputs")
+                  )
                   if not (is_macro_file or has_macro_refs):
                       continue
 
+                  macro_files_checked.append(path)
                   updated = original
                   changes: list[str] = []
 
-                  rules = [
-                      (r"\b(MAX_MACRO_LIMIT\s*=\s*)\d+", rf"\g<1>{slots}", f"MAX_MACRO_LIMIT -> {slots}"),
-                      (r"\b(MAX_MACRO_INPUT_LIMIT\s*=\s*)\d+", rf"\g<1>{inputs}", f"MAX_MACRO_INPUT_LIMIT -> {inputs}"),
-                      (r"\b(MACRO_LIMIT\s*=\s*)\d+", rf"\g<1>{slots}", f"MACRO_LIMIT -> {slots}"),
-                      (r"\b(MACRO_INPUT_LIMIT\s*=\s*)\d+", rf"\g<1>{inputs}", f"MACRO_INPUT_LIMIT -> {inputs}"),
-                      (r"(macroList\.length\s*(?:<|<=|>=|>|===|==)\s*)6\b", rf"\g<1>{slots}", f"macroList.length -> {slots}"),
-                      (r"(macroInputs\.length\s*(?:<|<=|>=|>|===|==)\s*)30\b", rf"\g<1>{inputs}", f"macroInputs.length -> {inputs}"),
-                      (r"(macroList\.slice\(\s*0\s*,\s*)6(\s*\))", rf"\g<1>{slots}\g<2>", f"macroList.slice -> {slots}"),
-                      (r"(macroInputs\.slice\(\s*0\s*,\s*)30(\s*\))", rf"\g<1>{inputs}\g<2>", f"macroInputs.slice -> {inputs}"),
+                  slot_rules = [
+                      (r"\b((?:MAX_)?MACRO_LIMIT\s*=\s*)\d+", rf"\g<1>{slots}", f"MACRO_LIMIT -> {slots}"),
+                      (r"((?:macroList|macros)\.length\s*(?:<|<=|>=|>|===|==)\s*)6\b", rf"\g<1>{slots}", f"macroList.length -> {slots}"),
+                      (r"((?:macroList|macros)\.slice\(\s*0\s*,\s*)6(\s*\))", rf"\g<1>{slots}\g<2>", f"macroList.slice -> {slots}"),
                   ]
+                  input_rules = [
+                      (r"\b((?:MAX_)?(?:MACRO_)?INPUTS?_(?:LIMIT|MAX)\s*=\s*)\d+", rf"\g<1>{inputs}", f"INPUT_LIMIT/MAX -> {inputs}"),
+                      (r"\b(MAX_(?:MACRO_)?INPUTS?\s*=\s*)\d+", rf"\g<1>{inputs}", f"MAX_INPUTS -> {inputs}"),
+                      (r"((?:macroInputs|inputs)\.slice\(\s*0\s*,\s*)30(\s*\))", rf"\g<1>{inputs}\g<2>", f"macroInputs.slice -> {inputs}"),
+                  ]
+
                   if is_macro_file:
-                      rules.extend([
-                          (r"(Array\.from\(\s*\{\s*length\s*:\s*)6(\s*\})", rf"\g<1>{slots}\g<2>", f"Array.from -> {slots}"),
+                      slot_rules.extend([
+                          (r"(Array\.from\(\s*\{\s*length\s*:\s*)6(\s*\))", rf"\g<1>{slots}\g<2>", f"Array.from -> {slots}"),
                           (r"(new\s+Array\(\s*)6(\s*\))", rf"\g<1>{slots}\g<2>", f"new Array -> {slots}"),
                       ])
+                      input_rules.extend([
+                          (r"(\.length\s*(?:<|<=|>=|>|===|==)\s*)30\b", rf"\g<1>{inputs}", f".length-Check -> {inputs}"),
+                          (r"(\.max\(\s*)30(\s*[,)])", rf"\g<1>{inputs}\g<2>", f"schema .max() -> {inputs}"),
+                      ])
+                  else:
+                      input_rules.append(
+                          (r"((?:macroInputs|inputs)\.length\s*(?:<|<=|>=|>|===|==)\s*)30\b", rf"\g<1>{inputs}", f"macroInputs.length -> {inputs}")
+                      )
 
-                  for pattern, repl, desc in rules:
+                  for pattern, repl, desc in slot_rules:
+                      prev = updated
                       updated, count = apply_regex(updated, pattern, repl)
-                      if count:
+                      if count and updated != prev:
                           changes.append(f"{desc} ({count}x)")
+
+                  for pattern, repl, desc in input_rules:
+                      prev = updated
+                      updated, count = apply_regex(updated, pattern, repl)
+                      if count and updated != prev:
+                          changes.append(f"{desc} ({count}x)")
+                          inputs_patched = True
 
                   if write_if_changed(path, original, updated, changes):
                       patched_files += 1
 
               if patched_files == 0:
-                  print("[HINWEIS] Keine Web-UI-Dateien geändert – ggf. InputMacroAddonPage prüfen.")
+                  print("[HINWEIS] Keine Web-UI-Dateien geändert.")
+
+              if not inputs_patched:
+                  print("[DIAGNOSE] Kein Web-UI-Input-Limit (30) getroffen. Offene '30'-Zeilen in Makro-Dateien:")
+                  for path in macro_files_checked:
+                      for idx, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                          if re.search(r"\b30\b", line):
+                              print(f"    {path.relative_to(repo)}:{idx}: {line.strip()}")
 
 
           def main() -> None:
@@ -327,6 +357,12 @@ jobs:
             npm install
           fi
           npm run build
+
+      - name: Clone Raspberry Pi Pico SDK (1.5.1)
+        run: |
+          git clone --branch 1.5.1 --depth 1 https://github.com/raspberrypi/pico-sdk.git /tmp/pico-sdk
+          git -C /tmp/pico-sdk submodule update --init
+          echo "PICO_SDK_PATH=/tmp/pico-sdk" >> "$GITHUB_ENV"
 
       - name: Configure & Build Firmware
         run: |
