@@ -1,0 +1,512 @@
+name: Flatbox Ultra S - 10 Macros x 22 Lines + Pin Mapping (All-in-One v5)
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: "Ordnername unter configs/ (z. B. FlatboxUltra, FlatboxRev4 oder Haute42)"
+        required: true
+        default: "FlatboxRev4"
+      max_macro_inputs:
+        description: "Zielwert Eingabezeilen pro Makro (Standard: 22)"
+        required: true
+        default: "22"
+
+jobs:
+  build-firmware:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Repository inkl. Submodules auschecken
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Node.js 20 für Web-UI einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: ARM-Toolchain & Build-Tools installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib \
+            python3 python3-protobuf protobuf-compiler
+
+      - name: All-in-One Patch anwenden (10x22 Makros, fixed32 + JSON-Macro-Fix)
+        env:
+          TARGET_INPUTS: ${{ inputs.max_macro_inputs }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+          import tempfile
+
+          ROOT = pathlib.Path.cwd()
+          MAX_MACROS = 10
+          MAX_LABEL_SIZE = 16
+          HTTP_POST_BUF_SIZE = 32768
+          EEPROM_LIMIT = 32768
+          MIN_SAFE_INPUTS = 18  # größtes Makro im Backup (Slot 2) hat 18 Zeilen
+          PREFERRED_MACRO_IDS = {
+              7: 143,
+              8: 144,
+              9: 145,
+              10: 146,
+          }
+          target_inputs = int(os.environ.get("TARGET_INPUTS", "22"))
+
+          def read_text(p: pathlib.Path) -> str:
+              return p.read_text(encoding="utf-8")
+
+          def write_text(p: pathlib.Path, content: str) -> None:
+              p.write_text(content, encoding="utf-8", newline="\n")
+
+          # 1. EEPROM_SIZE_BYTES aus headers/ und src/ auslesen (Fallback: 32768)
+          for folder in ("headers", "src"):
+              base = ROOT / folder
+              if not base.exists():
+                  continue
+              found_eeprom = False
+              for h in base.rglob("*"):
+                  if h.suffix not in (".h", ".hpp", ".cpp"):
+                      continue
+                  txt = read_text(h)
+                  m = re.search(r"#define\s+EEPROM_SIZE_BYTES\s+(\d+)", txt)
+                  if not m:
+                      m = re.search(r"static_assert\s*\(\s*Config_size\s*<=\s*(\d+)", txt)
+                  if m:
+                      EEPROM_LIMIT = int(m.group(1))
+                      print(f"[INFO] EEPROM-Limit erkannt: {EEPROM_LIMIT} Bytes ({h.relative_to(ROOT)})")
+                      found_eeprom = True
+                      break
+              if found_eeprom:
+                  break
+          else:
+              print(f"[INFO] Standard-EEPROM-Limit verwendet: {EEPROM_LIMIT} Bytes")
+
+          # 2. proto/enums.proto: BUTTON_PRESS_MACRO_7..10 mit IDs 143..146 (oder nächstfreien IDs) eintragen
+          enums_path = ROOT / "proto" / "enums.proto"
+          enums_text = read_text(enums_path)
+          match = re.search(r"(enum\s+GpioAction\s*\{)(.*?)(\n\})", enums_text, flags=re.S)
+          if not match:
+              sys.exit("[FEHLER] enum GpioAction in proto/enums.proto nicht gefunden.")
+
+          header, body, footer = match.groups()
+          existing = {
+              int(num): int(val)
+              for num, val in re.findall(r"BUTTON_PRESS_MACRO_(\d+)\s*=\s*(\d+)", body)
+          }
+          used_ids = {int(v) for v in re.findall(r"=\s*(-?\d+)\s*;", body)}
+          next_id = max(used_ids) + 1
+
+          macro_ids = {}
+          additions = []
+          for n in range(7, MAX_MACROS + 1):
+              if n in existing:
+                  macro_ids[n] = existing[n]
+              elif PREFERRED_MACRO_IDS[n] not in used_ids:
+                  macro_ids[n] = PREFERRED_MACRO_IDS[n]
+                  used_ids.add(PREFERRED_MACRO_IDS[n])
+                  additions.append(f"    BUTTON_PRESS_MACRO_{n} = {PREFERRED_MACRO_IDS[n]};")
+              else:
+                  while next_id in used_ids:
+                      next_id += 1
+                  macro_ids[n] = next_id
+                  used_ids.add(next_id)
+                  additions.append(f"    BUTTON_PRESS_MACRO_{n} = {next_id};")
+                  next_id += 1
+
+          if additions:
+              new_body = body.rstrip() + "\n" + "\n".join(additions)
+              enums_text = enums_text[:match.start()] + header + new_body + footer + enums_text[match.end():]
+              write_text(enums_path, enums_text)
+
+          print(f"[OK] proto/enums.proto -> MACRO_7..10 IDs: {macro_ids}")
+
+          # 3. Protobuf-Limits + sichere 32-KB-Optimierung (fixed32 in MacroInput + ungenutzte String-Puffer)
+          opts_path = ROOT / "proto" / "config.options"
+          proto_path = ROOT / "proto" / "config.proto"
+          opts_orig = read_text(opts_path) if opts_path.exists() else None
+          proto_orig = read_text(proto_path) if proto_path.exists() else None
+
+          if opts_orig is None and proto_orig is None:
+              sys.exit("[FEHLER] Weder proto/config.options noch proto/config.proto gefunden.")
+
+          def patch_inline_proto(text: str, field_regex: str, option_name: str, new_val: int, shrink_only: bool = False):
+              count = 0
+              out_lines = []
+              for line in text.splitlines():
+                  if re.search(field_regex, line, flags=re.I) and option_name in line:
+                      def _repl(m: re.Match) -> str:
+                          old_v = int(m.group(2))
+                          if shrink_only and old_v <= new_val:
+                              return m.group(0)
+                          return f"{m.group(1)}{new_val}"
+                      new_line = re.sub(rf"({option_name}\s*[:=]\s*)(\d+)", _repl, line)
+                      if new_line != line:
+                          count += 1
+                          line = new_line
+                  out_lines.append(line)
+              return "\n".join(out_lines) + ("\n" if text.endswith("\n") else ""), count
+
+          def optimize_macro_input_wire_types(proto_text: str):
+              """
+              Ersetzt in message MacroInput uint32 -> fixed32 (und int32 -> sfixed32).
+              C++-Struct-Typen bleiben identisch (uint32_t / int32_t), aber nanopb spart
+              3 Bytes pro MacroInput im worst-case Config_size (bei 10x22 = 660 Bytes!).
+              """
+              m = re.search(r"(message\s+MacroInput\s*\{)(.*?)(\n\})", proto_text, flags=re.S)
+              if not m:
+                  return proto_text, 0
+              hdr, bdy, ftr = m.groups()
+              new_bdy = re.sub(r"\buint32\b", "fixed32", bdy)
+              new_bdy = re.sub(r"\bint32\b", "sfixed32", new_bdy)
+              changed = 1 if new_bdy != bdy else 0
+              return proto_text[:m.start()] + hdr + new_bdy + ftr + proto_text[m.end():], changed
+
+          # Sichere String-Kürzungen (alles über den tatsächlich genutzten Werten im Backup,
+          # keine Arrays, kein PS4-Auth, kein Splash-Image, keine LEDs)
+          SAFE_STRING_TRIMS = [
+              (r"\bsplashTextLine[123]\b", 12),        # im Backup leer (splashTextEnabled=0)
+              (r"\badvancedSOCD[1-4]Name\b", 8),       # im Backup leer (advancedSOCDEnabled=0)
+              (r"\busbDescManufacturer\b", 28),        # im Backup "Open Stick Community" (20 Zeichen)
+              (r"\busbDescProduct\b", 28),             # im Backup "GP2040-CE (Custom)" (18 Zeichen)
+              (r"\busbDescVersion\b", 8),              # im Backup "1.0" (3 Zeichen)
+              (r"\bprofileLabel\b", 16),               # im Backup "MK 11" (5 Zeichen)
+          ]
+
+          def apply_macro_proto_limits(inputs_count: int, compact_strings: bool = True) -> None:
+              c_list = 0
+              c_inputs = 0
+              c_label = 0
+              c_fixed = 0
+              c_trims = 0
+
+              if opts_orig is not None:
+                  t = opts_orig
+                  t, c1 = re.subn(r"(MacroOptions\.macroList\s+max_count:)\d+", rf"\g<1>{MAX_MACROS}", t)
+                  t, c2 = re.subn(r"(Macro\.macroInputs\s+max_count:)\d+", rf"\g<1>{inputs_count}", t)
+                  t, c3 = re.subn(r"(Macro\.macroLabel\s+max_size:)\d+", rf"\g<1>{MAX_LABEL_SIZE}", t)
+                  c_list += c1
+                  c_inputs += c2
+                  c_label += c3
+                  if c1 or c2 or c3:
+                      write_text(opts_path, t)
+
+              if proto_orig is not None:
+                  p = proto_orig
+                  p, p1 = patch_inline_proto(p, r"\bmacro_?list\b", "max_count", MAX_MACROS)
+                  p, p2 = patch_inline_proto(p, r"\bmacro_?inputs\b", "max_count", inputs_count)
+                  p, p3 = patch_inline_proto(p, r"\bmacro_?label\b", "max_size", MAX_LABEL_SIZE)
+                  p, c_fixed = optimize_macro_input_wire_types(p)
+                  if compact_strings:
+                      for regex, max_len in SAFE_STRING_TRIMS:
+                          p, cnt = patch_inline_proto(p, regex, "max_size", max_len, shrink_only=True)
+                          c_trims += cnt
+                  c_list += p1
+                  c_inputs += p2
+                  c_label += p3
+                  if p1 or p2 or p3 or c_fixed or c_trims:
+                      write_text(proto_path, p)
+
+              if c_list == 0 or c_inputs == 0:
+                  sys.exit(f"[FEHLER] Konnte Macro-Limits nicht finden (list={c_list}, inputs={c_inputs}).")
+
+              return c_fixed, c_trims
+
+          nanopb_gens = list(ROOT.rglob("nanopb_generator.py"))
+          nanopb_protos = list(ROOT.rglob("nanopb.proto"))
+
+          def measure_config_size():
+              if not nanopb_gens or not nanopb_protos:
+                  return None
+              gen = nanopb_gens[0]
+              npb_inc = nanopb_protos[0].parent
+              proto_files = [str(p) for p in sorted((ROOT / "proto").glob("*.proto"))]
+              with tempfile.TemporaryDirectory() as tmp:
+                  pb_file = pathlib.Path(tmp) / "config.pb"
+                  cmd_protoc = [
+                      "protoc",
+                      f"-I{ROOT / 'proto'}",
+                      f"-I{npb_inc}",
+                      f"-o{pb_file}",
+                      *proto_files,
+                  ]
+                  r1 = subprocess.run(cmd_protoc, capture_output=True, text=True)
+                  if r1.returncode != 0:
+                      print(f"[WARN] protoc-Vorprüfung übersprungen: {r1.stderr.strip()}")
+                      return None
+                  cmd_gen = [
+                      sys.executable,
+                      str(gen),
+                      f"-I{ROOT / 'proto'}",
+                      f"-I{npb_inc}",
+                      f"-D{tmp}",
+                      str(pb_file),
+                  ]
+                  r2 = subprocess.run(cmd_gen, capture_output=True, text=True)
+                  if r2.returncode != 0:
+                      print(f"[WARN] nanopb-Vorprüfung übersprungen: {r2.stderr.strip()}")
+                      return None
+                  pb_h = pathlib.Path(tmp) / "config.pb.h"
+                  if not pb_h.exists():
+                      return None
+                  m = re.search(r"#define\s+Config_size\s+(\d+)", read_text(pb_h))
+                  return int(m.group(1)) if m else None
+
+          final_inputs = target_inputs
+          while final_inputs >= 12:
+              c_fixed, c_trims = apply_macro_proto_limits(final_inputs, compact_strings=True)
+              size = measure_config_size()
+              if size is None:
+                  print(f"[INFO] 32-KB-Vorprüfung nicht verfügbar, nutze Zielwert: {final_inputs} Zeilen.")
+                  break
+              print(f"[CHECK] 10 Slots x {final_inputs} Zeilen (fixed32={c_fixed}, trims={c_trims}) -> Config_size = {size} / {EEPROM_LIMIT} Bytes")
+              if size <= EEPROM_LIMIT:
+                  print(f"[OK] Passt sauber in 32 KB (Reserve: {EEPROM_LIMIT - size} Bytes).")
+                  break
+              final_inputs -= 1
+          else:
+              sys.exit("[FEHLER] Selbst mit 12 Zeilen pro Makro passt Config_size nicht in 32 KB.")
+
+          print(f"[OK] Protobuf gepatcht: 10 Makros x {final_inputs} Zeilen (Label max {MAX_LABEL_SIZE})")
+
+          # 4. C++ Headers & Sources: MAX_MACRO_LIMIT, MAX_MACRO_INPUT_LIMIT, Pin-Mapping & Web-Puffer
+          for folder in ("headers", "src"):
+              base = ROOT / folder
+              if not base.exists():
+                  continue
+              for path in base.rglob("*"):
+                  if path.suffix not in (".h", ".hpp", ".cpp"):
+                      continue
+                  text = read_text(path)
+                  orig = text
+
+                  text = re.sub(r"(#define\s+MAX_MACRO_LIMIT\s+)\d+", rf"\g<1>{MAX_MACROS}", text)
+                  text = re.sub(r"(#define\s+MAX_MACRO_INPUT_LIMIT\s+)\d+", rf"\g<1>{final_inputs}", text)
+
+                  # Eventuelle hartcodierte Array-Größen wie macroPinMasks[6] oder actionList[6] auf MAX_MACRO_LIMIT heben
+                  text = re.sub(r"\b(macroPinMasks\s*\[\s*)(?:6|8)(\s*\])", r"\g<1>MAX_MACRO_LIMIT\g<2>", text)
+                  if "BUTTON_PRESS_MACRO_1" in text and "actionList[" in text:
+                      text = re.sub(r"\b(actionList\s*\[\s*)(?:6|8)(\s*\])", r"\g<1>MAX_MACRO_LIMIT\g<2>", text)
+
+                  found_nums = [int(x) for x in re.findall(r"BUTTON_PRESS_MACRO_(\d+)", text)]
+                  if found_nums:
+                      highest = max(found_nums)
+                      if highest < MAX_MACROS:
+                          patched_here = False
+
+                          # Fall A: switch/case Block (mit break; oder return;)
+                          case_pat = re.compile(
+                              rf"([ \t]*case\s+GpioAction::BUTTON_PRESS_MACRO_{highest}\s*:.*?(?:break|return[^;]*)\s*;)",
+                              flags=re.S,
+                          )
+                          def expand_case(m: re.Match) -> str:
+                              block = m.group(1)
+                              out = [block]
+                              for n in range(highest + 1, MAX_MACROS + 1):
+                                  c = block.replace(f"BUTTON_PRESS_MACRO_{highest}", f"BUTTON_PRESS_MACRO_{n}")
+                                  c = c.replace(f"[{highest - 1}]", f"[{n - 1}]")
+                                  out.append(c)
+                              return "\n".join(out)
+                          text, cnt_case = case_pat.subn(expand_case, text)
+                          if cnt_case > 0:
+                              patched_here = True
+
+                          # Fall B: Array-/Initializer-Ende auf einer Zeile wie
+                          #   "... GpioAction::BUTTON_PRESS_MACRO_6 };" (z. B. src/config_utils.cpp:2257)
+                          init_pat = re.compile(
+                              rf"(GpioAction::BUTTON_PRESS_MACRO_{highest})(\s*\}}\s*;)"
+                          )
+                          def expand_init(m: re.Match) -> str:
+                              extras = ", ".join(f"GpioAction::BUTTON_PRESS_MACRO_{n}" for n in range(highest + 1, MAX_MACROS + 1))
+                              return f"{m.group(1)}, {extras}{m.group(2)}"
+                          text, cnt_init = init_pat.subn(expand_init, text)
+                          if cnt_init > 0:
+                              patched_here = True
+
+                          # Fall C: Einzelzeilen-Eintrag (nur wenn KEIN ';' und KEIN '}' und nur 1 MACRO auf der Zeile)
+                          if not patched_here:
+                              line_pat = re.compile(
+                                  rf"^([ \t]*[^;\}}\n]*BUTTON_PRESS_MACRO_{highest}[^;\}}\n]*)$",
+                                  flags=re.M,
+                              )
+                              def expand_line(m: re.Match) -> str:
+                                  line = m.group(1)
+                                  if len(re.findall(r"BUTTON_PRESS_MACRO_\d+", line)) != 1:
+                                      return line
+                                  out = [line if line.rstrip().endswith(",") else line + ","]
+                                  for n in range(highest + 1, MAX_MACROS + 1):
+                                      c = line.replace(f"BUTTON_PRESS_MACRO_{highest}", f"BUTTON_PRESS_MACRO_{n}")
+                                      c = c.replace(f"[{highest - 1}]", f"[{n - 1}]")
+                                      if n < MAX_MACROS and not c.rstrip().endswith(","):
+                                          c += ","
+                                      out.append(c)
+                                  return "\n".join(out)
+                              text = line_pat.sub(expand_line, text)
+
+                  # X-Macro-Aliase für FIXED32/SFIXED32 in config_utils.cpp ergänzen (TO_JSON_FIXED32 / FROM_JSON_FIXED32)
+                  if path.name == "config_utils.cpp":
+                      def _add_fixed_aliases(src_text: str) -> str:
+                          out_lines = []
+                          for ln in src_text.splitlines():
+                              m_u = re.match(r"^([ \t]*)#define\s+([A-Z0-9_]+_)UINT32\b", ln)
+                              if m_u:
+                                  ind, pref = m_u.groups()
+                                  alias = f"{pref}FIXED32"
+                                  if f"#define {alias}" not in src_text and f"#define\t{alias}" not in src_text:
+                                      out_lines.append(f"{ind}#define {alias} {pref}UINT32")
+                              m_i = re.match(r"^([ \t]*)#define\s+([A-Z0-9_]+_)(?<!U)INT32\b", ln)
+                              if m_i:
+                                  ind, pref = m_i.groups()
+                                  alias = f"{pref}SFIXED32"
+                                  if f"#define {alias}" not in src_text and f"#define\t{alias}" not in src_text:
+                                      out_lines.append(f"{ind}#define {alias} {pref}INT32")
+                              out_lines.append(ln)
+                          return "\n".join(out_lines) + ("\n" if src_text.endswith("\n") else "")
+                      text = _add_fixed_aliases(text)
+
+                  if path.name == "webconfig.cpp":
+                      buf_pat = re.compile(r"(http_post_payload_len\s*=\s*)(\d+)(\s*;)")
+                      bm = buf_pat.search(text)
+                      if bm and int(bm.group(2)) < HTTP_POST_BUF_SIZE:
+                          text = buf_pat.sub(rf"\g<1>{HTTP_POST_BUF_SIZE}\g<3>", text, count=1)
+                          print(f"[OK] webconfig.cpp: http_post_payload_len -> {HTTP_POST_BUF_SIZE}")
+
+                  if text != orig:
+                      write_text(path, text)
+                      print(f"[OK] C++ gepatcht: {path.relative_to(ROOT)}")
+
+          # 5. React Web-UI (Pins, Locales & Macro-Editor)
+          www_src = ROOT / "www" / "src"
+          if not www_src.exists():
+              sys.exit("[FEHLER] www/src nicht gefunden.")
+
+          for ts_file in www_src.rglob("*"):
+              if ts_file.suffix not in (".ts", ".tsx", ".js", ".jsx"):
+                  continue
+              text = read_text(ts_file)
+              orig = text
+
+              if "BUTTON_PRESS_MACRO_6" in text:
+                  text = re.sub(r"^[ \t]*BUTTON_PRESS_MACRO_(?:7|8|9|10)\s*:\s*\d+,?\s*\n?", "", text, flags=re.M)
+                  text = re.sub(r"^[ \t]*[A-Za-z0-9_.]*?BUTTON_PRESS_MACRO_(?:7|8|9|10),?\s*\n?", "", text, flags=re.M)
+
+                  def expand_action_def(m: re.Match) -> str:
+                      indent, val, comma = m.group(1), m.group(2), m.group(3)
+                      lines = [f"{indent}BUTTON_PRESS_MACRO_6: {val},"]
+                      for n in range(7, MAX_MACROS + 1):
+                          end_c = comma if n == MAX_MACROS else ","
+                          lines.append(f"{indent}BUTTON_PRESS_MACRO_{n}: {macro_ids[n]}{end_c}")
+                      return "\n".join(lines)
+
+                  text = re.sub(
+                      r"^([ \t]*)BUTTON_PRESS_MACRO_6\s*:\s*(\d+)(,?)\s*$",
+                      expand_action_def,
+                      text,
+                      flags=re.M,
+                  )
+
+                  def expand_action_ref(m: re.Match) -> str:
+                      indent, prefix, comma = m.group(1), m.group(2), m.group(3)
+                      lines = [f"{indent}{prefix}BUTTON_PRESS_MACRO_6,"]
+                      for n in range(7, MAX_MACROS + 1):
+                          end_c = comma if n == MAX_MACROS else ","
+                          lines.append(f"{indent}{prefix}BUTTON_PRESS_MACRO_{n}{end_c}")
+                      return "\n".join(lines)
+
+                  text = re.sub(
+                      r"^([ \t]*)([A-Za-z0-9_.]*?)BUTTON_PRESS_MACRO_6(,?)\s*$",
+                      expand_action_ref,
+                      text,
+                      flags=re.M,
+                  )
+
+              if "macro" in ts_file.name.lower():
+                  text = re.sub(r"\b(MAX_MACROS\s*=\s*)(?:6|8)\b", rf"\g<1>{MAX_MACROS}", text)
+                  text = re.sub(r"\b(MAX_MACRO_INPUTS\s*=\s*)(?:18|20|25|30)\b", rf"\g<1>{final_inputs}", text)
+                  text = re.sub(r"(\.length\s*(?:<|>=|===)\s*)(?:6|8)\b", rf"\g<1>{MAX_MACROS}", text)
+                  text = re.sub(r"(\.length\s*(?:<|>=|===)\s*)(?:18|20|25|30)\b", rf"\g<1>{final_inputs}", text)
+
+              if text != orig:
+                  write_text(ts_file, text)
+                  print(f"[OK] Web-UI gepatcht: {ts_file.relative_to(ROOT)}")
+
+          locales_dir = www_src / "Locales"
+          if locales_dir.exists():
+              loc_pat = re.compile(
+                  r"""^([ \t]*)(['"]?)BUTTON_PRESS_MACRO_6\2\s*:\s*(['"])(.*?)6(.*?)\3(,?)\s*$""",
+                  flags=re.M,
+              )
+              for loc_file in locales_dir.rglob("*"):
+                  if loc_file.suffix not in (".js", ".jsx", ".ts", ".tsx", ".json"):
+                      continue
+                  text = read_text(loc_file)
+                  if "BUTTON_PRESS_MACRO_6" not in text:
+                      continue
+                  text = re.sub(
+                      r"""^[ \t]*(['"]?)BUTTON_PRESS_MACRO_(?:7|8|9|10)\1\s*:.*\n?""",
+                      "",
+                      text,
+                      flags=re.M,
+                  )
+                  def expand_locale(m: re.Match) -> str:
+                      indent, kq, vq, prefix, suffix, comma = m.groups()
+                      lines = [f"{indent}{kq}BUTTON_PRESS_MACRO_6{kq}: {vq}{prefix}6{suffix}{vq},"]
+                      for n in range(7, MAX_MACROS + 1):
+                          end_c = comma if n == MAX_MACROS else ","
+                          lines.append(f"{indent}{kq}BUTTON_PRESS_MACRO_{n}{kq}: {vq}{prefix}{n}{suffix}{vq}{end_c}")
+                      return "\n".join(lines)
+                  new_text, cnt = loc_pat.subn(expand_locale, text)
+                  if cnt > 0:
+                      write_text(loc_file, new_text)
+                      print(f"[OK] Locale ergänzt: {loc_file.relative_to(ROOT)}")
+
+          # 6. Abschluss-Audit
+          missed = []
+          for folder in ("proto", "headers", "src", "www/src"):
+              base = ROOT / folder
+              if not base.exists():
+                  continue
+              for p in base.rglob("*"):
+                  if p.is_file() and p.suffix in (".proto", ".h", ".hpp", ".cpp", ".ts", ".tsx", ".js", ".jsx", ".json"):
+                      t = read_text(p)
+                      if "BUTTON_PRESS_MACRO_6" in t and "BUTTON_PRESS_MACRO_10" not in t:
+                          missed.append(str(p.relative_to(ROOT)))
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as gh_env:
+              gh_env.write(f"FINAL_MACRO_INPUTS={final_inputs}\n")
+
+          if missed:
+              print("[WARNUNG] Noch nicht bis MACRO_10 erweiterte Stellen:")
+              for item in missed:
+                  print(f"  - {item}")
+          else:
+              print(f"[OK] Audit bestanden: 10 Makro-Slots x {final_inputs} Zeilen + Pin-Mapping ({macro_ids}) bereit.")
+          PY
+
+      - name: Web-UI Dependencies installieren
+        working-directory: www
+        run: npm ci
+
+      - name: Firmware + eingebettete Web-UI kompilieren
+        env:
+          PICO_SDK_FETCH_FROM_GIT: "ON"
+          PICO_SDK_FETCH_FROM_GIT_TAG: "2.3.1"
+        run: |
+          cmake -B build -G Ninja \
+            -DGP2040_BOARDCONFIG="${{ inputs.board }}" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: Fertige .uf2 als Download bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Flatbox-${{ inputs.board }}-10Macros-${{ env.FINAL_MACRO_INPUTS }}Lines
+          path: build/*.uf2
