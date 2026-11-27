@@ -1,0 +1,135 @@
+name: Build GP2040-CE All Boards (8 Macros All-in-One)
+
+on:
+  workflow_dispatch:
+    inputs:
+      boards:
+        description: 'ALL für alle Boards oder kommagetrennte Liste (z. B. FlatboxRev4,Pico)'
+        required: true
+        default: 'ALL'
+      max_macro_inputs:
+        description: 'Maximale Input-Zeilen pro Makro (Standard: 24 für 32-KB-EEPROM)'
+        required: true
+        default: '24'
+      parallel_jobs:
+        description: 'Anzahl paralleler Build-Runner (1-10)'
+        required: true
+        default: '6'
+
+jobs:
+  prepare:
+    name: Prepare Patch, Web-UI & Board Matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: \${{ steps.discover.outputs.matrix }}
+      total_boards: \${{ steps.discover.outputs.total_boards }}
+      max_inputs: \${{ steps.discover.outputs.max_inputs }}
+
+    env:
+      BOARDS_INPUT: \${{ github.event.inputs.boards || 'ALL' }}
+      MAX_MACRO_INPUTS: \${{ github.event.inputs.max_macro_inputs || '24' }}
+      PARALLEL_JOBS: \${{ github.event.inputs.parallel_jobs || '6' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Patch 8 macro slots (C++, Protobuf & Web-UI)
+        run: |
+          cat << 'EOF' > patch_8_macros.mjs
+          import fs from 'fs';
+          import path from 'path';
+
+          const TARGET_MACROS = 8;
+          const TARGET_INPUTS = process.env.MAX_MACRO_INPUTS
+            ? Number(process.env.MAX_MACRO_INPUTS)
+            : 24;
+
+          function walk(dir, files = []) {
+            if (!fs.existsSync(dir)) return files;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                if (['node_modules', 'dist', 'build', '.git'].includes(entry.name)) continue;
+                walk(full, files);
+              } else {
+                files.push(full);
+              }
+            }
+            return files;
+          }
+
+          function patchFile(filePath, replacer, required = false) {
+            if (!fs.existsSync(filePath)) {
+              if (required) throw new Error(`❌ Pflichtdatei nicht gefunden: ${filePath}`);
+              console.warn(`⚠️ Übersprungen (nicht gefunden): ${filePath}`);
+              return false;
+            }
+            const original = fs.readFileSync(filePath, 'utf8');
+            const updated = replacer(original);
+            if (original !== updated) {
+              fs.writeFileSync(filePath, updated, 'utf8');
+              console.log(`✅ Gepatcht: ${filePath}`);
+              return true;
+            }
+            if (required) {
+              throw new Error(`❌ Patch hat in Pflichtdatei nicht gegriffen: ${filePath}`);
+            }
+            return false;
+          }
+
+          // 1. C++ Makro-Limit und Input-Limit
+          patchFile(
+            'headers/addons/input_macro.h',
+            (content) => {
+              let out = content.replace(
+                /#define\s+MAX_MACRO_LIMIT\s+\d+/,
+                `#define MAX_MACRO_LIMIT ${TARGET_MACROS}`
+              );
+              if (TARGET_INPUTS && Number.isInteger(TARGET_INPUTS) && TARGET_INPUTS > 0) {
+                out = out.replace(
+                  /#define\s+MAX_MACRO_INPUT_LIMIT\s+\d+/,
+                  `#define MAX_MACRO_INPUT_LIMIT ${TARGET_INPUTS}`
+                );
+              }
+              return out;
+            },
+            true
+          );
+
+          // 2. Protobuf Nanopb max_count (config.options ODER inline in config.proto)
+          let patchedProtoLimit = false;
+
+          if (fs.existsSync('proto/config.options')) {
+            patchedProtoLimit = patchFile(
+              'proto/config.options',
+              (content) => {
+                let out = content.replace(
+                  /(MacroOptions\.macroList\s+max_count\s*:\s*)\d+/,
+                  (_, p1) => `${p1}${TARGET_MACROS}`
+                );
+                if (TARGET_INPUTS && Number.isInteger(TARGET_INPUTS) && TARGET_INPUTS > 0) {
+                  out = out.replace(
+                    /(Macro\.macroInputs\s+max_count\s*:\s*)\d+/,
+                    (_, p1) => `${p1}${TARGET_INPUTS}`
+                  );
+                }
+                return out;
+              },
+              false
+            );
+          }
+
+          if (!patchedProtoLimit && fs.existsSync('proto/config.proto')) {
+            patchedProtoLimit = patchFile(
+              'proto/config.proto',
+              (content) => {
+                let out = content.replace(
+                  /(macroList\s*
